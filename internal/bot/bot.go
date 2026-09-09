@@ -9,9 +9,9 @@ import (
 
 	"github.com/bwmarrin/discordgo"
 
-	"discord-bot/internal/config"
-	"discord-bot/internal/llm"
-	"discord-bot/internal/store"
+	"app/internal/config"
+	"app/internal/llm"
+	"app/internal/store"
 )
 
 const discordMaxLen = 2000

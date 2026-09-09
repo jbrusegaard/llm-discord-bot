@@ -5,8 +5,8 @@ import (
 	"log/slog"
 	"time"
 
-	"discord-bot/internal/llm"
-	"discord-bot/internal/store"
+	"app/internal/llm"
+	"app/internal/store"
 )
 
 const (

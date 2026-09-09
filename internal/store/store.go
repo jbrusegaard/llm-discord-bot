@@ -10,7 +10,7 @@ import (
 
 	_ "modernc.org/sqlite"
 
-	"discord-bot/internal/llm"
+	"app/internal/llm"
 )
 
 // retention caps how many messages are kept per conversation to bound growth.

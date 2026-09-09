@@ -11,9 +11,9 @@ import (
 
 	"github.com/bwmarrin/discordgo"
 
-	"discord-bot/internal/bot"
-	"discord-bot/internal/config"
-	"discord-bot/internal/store"
+	"app/internal/bot"
+	"app/internal/config"
+	"app/internal/store"
 )
 
 // Set at build time via -ldflags (see Makefile).

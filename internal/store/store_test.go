@@ -7,7 +7,7 @@ import (
 
 	_ "modernc.org/sqlite"
 
-	"discord-bot/internal/llm"
+	"app/internal/llm"
 )
 
 // openRaw opens the SQLite file without running schema/migration logic,
