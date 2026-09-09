@@ -147,6 +147,14 @@ func (b *Bot) chat(userID, channelID, text string) (string, error) {
 		return "", fmt.Errorf("load history: %w", err)
 	}
 	messages := []llm.Message{{Role: llm.RoleSystem, Content: b.system}}
+	// Local models have no clock of their own (knowledge is frozen at
+	// training cutoff), so tell them what time it is; without this they
+	// can't answer "what day is it?" correctly.
+	messages = append(messages, llm.Message{
+		Role:    llm.RoleSystem,
+		Content: "Current date and time on the machine running the bot: " +
+			time.Now().Format("Monday, January 2, 2006 at 3:04 PM MST"),
+	})
 	if summary, err := b.hist.GetSummary(userID, channelID); err == nil && summary != "" {
 		messages = append(messages, llm.Message{
 			Role:    llm.RoleSystem,
