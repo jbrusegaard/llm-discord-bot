@@ -94,6 +94,9 @@ func (b *Bot) HandleMessageCreate(_ *discordgo.Session, m *discordgo.MessageCrea
 	if text == "" {
 		return
 	}
+	// Rewrite other users' mentions so the model sees readable names while
+	// keeping exact ids it can pass to tools (e.g. mention_user_id).
+	text, mentionIDs := b.rewriteMentions(text, m)
 
 	if strings.EqualFold(text, "/reset") {
 		if err := b.hist.Clear(m.Author.ID, m.ChannelID); err != nil {
@@ -141,7 +144,11 @@ func (b *Bot) HandleMessageCreate(_ *discordgo.Session, m *discordgo.MessageCrea
 			var sb strings.Builder
 			fmt.Fprintf(&sb, "⏰ You have %d pending reminder(s):\n", len(pending))
 			for _, r := range pending {
-				fmt.Fprintf(&sb, "• %s — %s\n", whenText(r.DueAt), r.Message)
+				suffix := ""
+				if r.TargetUserID != "" && r.TargetUserID != m.Author.ID {
+					suffix = fmt.Sprintf(" (for <@%s>)", r.TargetUserID)
+				}
+				fmt.Fprintf(&sb, "• %s%s — %s\n", whenText(r.DueAt), suffix, r.Message)
 			}
 			out = strings.TrimRight(sb.String(), "\n")
 		}
@@ -165,7 +172,7 @@ func (b *Bot) HandleMessageCreate(_ *discordgo.Session, m *discordgo.MessageCrea
 		placeholder = nil
 	}
 
-	reply, err := b.chat(m.Author.ID, m.ChannelID, text)
+	reply, err := b.chat(m.Author.ID, m.ChannelID, text, mentionIDs)
 	if err != nil {
 		slog.Error("chat failed", "user", m.Author.Username, "err", err)
 		notice := "⚠️ Sorry, I couldn't get a response from the model. Please try again."
@@ -199,7 +206,9 @@ func (b *Bot) HandleMessageCreate(_ *discordgo.Session, m *discordgo.MessageCrea
 
 // chat runs the LLM round trip for one user turn in a specific
 // conversation (user + channel), updating that conversation's history.
-func (b *Bot) chat(userID, channelID, text string) (string, error) {
+// mentioned lists other users @mentioned in the triggering message; tools may
+// target them (e.g. "tell @Alec ... later").
+func (b *Bot) chat(userID, channelID, text string, mentioned map[string]bool) (string, error) {
 	past, err := b.hist.Recent(userID, channelID, b.maxHistory)
 	if err != nil {
 		return "", fmt.Errorf("load history: %w", err)
@@ -255,7 +264,7 @@ func (b *Bot) chat(userID, channelID, text string) (string, error) {
 	if len(replyMsg.ToolCalls) > 0 {
 		// The model wants to schedule something; execute the tool calls and
 		// let it write a short confirmation.
-		reply, err = b.handleToolCalls(userID, channelID, messages, replyMsg)
+		reply, err = b.handleToolCalls(userID, channelID, messages, replyMsg, mentioned)
 	} else {
 		reply = strings.TrimSpace(replyMsg.Content)
 	}
@@ -287,6 +296,24 @@ func (b *Bot) UpdatePresence(lmReachable bool) error {
 		state = "🔌 Waiting for LM Studio…"
 	}
 	return b.dg.UpdateCustomStatus(state)
+}
+
+// rewriteMentions replaces other users' <@id> tags with a readable form that
+// still carries the exact id ("@Alec (id 123...)"), so small models can copy
+// ids into tool arguments verbatim. Returns the rewritten text and the set of
+// mentioned user ids (the bot itself excluded).
+func (b *Bot) rewriteMentions(text string, m *discordgo.MessageCreate) (string, map[string]bool) {
+	mentioned := make(map[string]bool)
+	for _, u := range m.Mentions {
+		if u.ID == b.dg.State.User.ID {
+			continue
+		}
+		mentioned[u.ID] = true
+		replacement := fmt.Sprintf("@%s (id %s)", u.Username, u.ID)
+		text = strings.ReplaceAll(text, "<@!"+u.ID+">", replacement)
+		text = strings.ReplaceAll(text, "<@"+u.ID+">", replacement)
+	}
+	return text, mentioned
 }
 
 // splitMessage splits long text on newlines, then hard-cuts if needed.

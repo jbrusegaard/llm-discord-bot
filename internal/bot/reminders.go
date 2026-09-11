@@ -18,7 +18,7 @@ const reminderPollInterval = 20 * time.Second
 
 // reminderToolNote is appended to the system prompt so models that are shy
 // about tool calling still use create_reminder when asked.
-const reminderToolNote = "When the user asks to be reminded of something later (e.g. 'remind me in 10 minutes to stretch'), call the create_reminder tool, then briefly confirm."
+const reminderToolNote = "When the user asks to be reminded of something later (e.g. 'remind me in 10 minutes to stretch'), call the create_reminder tool, then briefly confirm. If they ask you to tell or remind ANOTHER mentioned user instead (e.g. 'tell @Alec he is lame in 5 minutes'), pass that user's id from their '(id ...)' tag as mention_user_id."
 
 // createReminderTool is offered to the model on every chat turn so it can
 // schedule reminders ("remind me in 10 minutes to stretch").
@@ -26,7 +26,7 @@ var createReminderTool = llm.Tool{
 	Type: "function",
 	Function: llm.Function{
 		Name:        "create_reminder",
-		Description: "Schedule a reminder that pings the user later. Use it when the user asks to be reminded of something (e.g. 'remind me in 10 minutes to stretch', 'ping me at 3pm about the meeting'). Provide either delay_minutes for relative times or due_at for specific clock times, plus a short message describing what to remind them about.",
+		Description: "Schedule a reminder that pings a user later. Use it when the user asks to be reminded of something (e.g. 'remind me in 10 minutes to stretch', 'ping me at 3pm about the meeting') or to tell another mentioned user something later (e.g. 'tell @Alec he is lame in 5 minutes'). Provide either delay_minutes for relative times or due_at for specific clock times, plus a short message describing what to remind them about.",
 		Parameters: map[string]any{
 			"type": "object",
 			"properties": map[string]any{
@@ -41,6 +41,10 @@ var createReminderTool = llm.Tool{
 				"message": map[string]any{
 					"type":        "string",
 					"description": "Short reminder text, e.g. 'stretch your legs' or 'meeting with Sam'.",
+				},
+				"mention_user_id": map[string]any{
+					"type":        "string",
+					"description": "Discord user id of ANOTHER mentioned user to ping instead of the requester, taken from their '(id ...)' tag in the message. Omit when reminding the requester themselves.",
 				},
 			},
 			"required": []string{"message"},
@@ -84,7 +88,10 @@ func (b *Bot) deliverDueReminders() {
 			continue
 		}
 		text := "⏰ " + r.Message
-		if channel.Type != discordgo.ChannelTypeDM {
+		switch {
+		case r.TargetUserID != "":
+			text = "<@" + r.TargetUserID + "> " + text
+		case channel.Type != discordgo.ChannelTypeDM:
 			text = "<@" + r.UserID + "> " + text
 		}
 		if _, err := b.dg.ChannelMessageSend(channel.ID, text); err != nil {
@@ -101,7 +108,9 @@ func (b *Bot) deliverDueReminders() {
 
 // handleToolCalls executes the model's tool calls (currently only
 // create_reminder), then asks the model for a short natural confirmation.
-func (b *Bot) handleToolCalls(userID, channelID string, messages []llm.Message, reply llm.Message) (string, error) {
+// mentioned lists the user ids that were @mentioned in the triggering message;
+// mention_user_id must be one of them.
+func (b *Bot) handleToolCalls(userID, channelID string, messages []llm.Message, reply llm.Message, mentioned map[string]bool) (string, error) {
 	followUp := make([]llm.Message, 0, len(messages)+len(reply.ToolCalls)+1)
 	followUp = append(followUp, messages...)
 	followUp = append(followUp, reply)
@@ -113,9 +122,10 @@ func (b *Bot) handleToolCalls(userID, channelID string, messages []llm.Message, 
 			continue
 		}
 		var args struct {
-			DelayMinutes *float64 `json:"delay_minutes"`
-			DueAt        string   `json:"due_at"`
-			Message      string   `json:"message"`
+			DelayMinutes  *float64 `json:"delay_minutes"`
+			DueAt         string   `json:"due_at"`
+			Message       string   `json:"message"`
+			MentionUserID string   `json:"mention_user_id"`
 		}
 		if err := json.Unmarshal([]byte(tc.Function.Arguments), &args); err != nil {
 			followUp = append(followUp, toolResult(tc.ID, fmt.Sprintf("Error: arguments were not valid JSON (%v). Call again.", err)))
@@ -124,6 +134,12 @@ func (b *Bot) handleToolCalls(userID, channelID string, messages []llm.Message, 
 		msg := strings.TrimSpace(args.Message)
 		if msg == "" {
 			followUp = append(followUp, toolResult(tc.ID, "Error: 'message' is empty. Call again with a short reminder text."))
+			continue
+		}
+
+		target := strings.TrimSpace(args.MentionUserID)
+		if target != "" && !mentioned[target] {
+			followUp = append(followUp, toolResult(tc.ID, fmt.Sprintf("Error: user id %q was not mentioned in this message. Use one of the ids given as '(id ...)' tags.", target)))
 			continue
 		}
 
@@ -144,14 +160,18 @@ func (b *Bot) handleToolCalls(userID, channelID string, messages []llm.Message, 
 			continue
 		}
 
-		id, err := b.hist.AddReminder(userID, channelID, msg, due)
+		id, err := b.hist.AddReminder(userID, target, channelID, msg, due)
 		if err != nil {
 			followUp = append(followUp, toolResult(tc.ID, fmt.Sprintf("Error: failed to store reminder (%v).", err)))
 			continue
 		}
-		slog.Info("reminder scheduled", "id", id, "user", userID, "channel", channelID, "due", due.Format(time.RFC3339))
+		slog.Info("reminder scheduled", "id", id, "user", userID, "target", target, "channel", channelID, "due", due.Format(time.RFC3339))
 		followUp = append(followUp, toolResult(tc.ID, fmt.Sprintf("OK: reminder #%d scheduled (due %s).", id, due.Format(time.RFC3339))))
-		fallback = append(fallback, fmt.Sprintf("⏰ Got it — I'll remind you about “%s” %s.", msg, whenText(due)))
+		if target != "" {
+			fallback = append(fallback, fmt.Sprintf("⏰ Got it — I'll remind <@%s> about “%s” %s.", target, msg, whenText(due)))
+		} else {
+			fallback = append(fallback, fmt.Sprintf("⏰ Got it — I'll remind you about “%s” %s.", msg, whenText(due)))
+		}
 	}
 
 	followUp = append(followUp, llm.Message{

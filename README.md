@@ -10,7 +10,7 @@ A Discord chat bot written in Go that answers using a local LM Studio server (Op
 - **Per-conversation memory**, persisted to SQLite across restarts — your DM, each channel, and each thread keep independent context (`/reset` clears the current conversation)
 - **Per-user long-term memory** — durable facts about you ("my friend is Alec") are mined from conversations in the background and remembered in *every* channel and DM; `/facts` shows what's stored
 - **Context compaction** — old messages are folded into a running summary in the background, so long conversations keep "memory" without an ever-growing prompt
-- **Reminders** — ask "remind me in 10 minutes to stretch" (or "ping me at 3pm about the meeting") and the bot schedules a ⏰ ping; `/reminders` lists what's pending
+- **Reminders** — ask "remind me in 10 minutes to stretch" (or "ping me at 3pm about the meeting") and the bot schedules a ⏰ ping; it can also target other users: "tell @Alec he is lame in 5 minutes" pings *them*; `/reminders` lists what's pending
 - Replies use Discord's native reply feature (including the 🤔 Thinking… placeholder), so answers stay attached to your message
 - Typing indicator while the model generates; long replies split across multiple messages
 - Bot status shows which model is loaded (`🧠 <model>`)
@@ -91,6 +91,8 @@ Real environment variables always win over `.env` values.
 ### How reminders work
 
 Every chat turn offers the model a `create_reminder` tool (OpenAI-style function calling). When you ask for a reminder, the model calls it with either a relative delay (`delay_minutes`) or an absolute time (`due_at`, RFC3339 in your local timezone — the bot tells the model the current date/time on every request), plus short reminder text. The bot stores it in SQLite (so reminders survive restarts) and a background worker checks every ~20 seconds, delivering due ones as `@you ⏰ <message>` in the channel where you asked.
+
+To target **another user** ("tell @Alec he is lame in 5 minutes"), @mention them in your message. The bot rewrites mentions like `<@123…>` into `@Alec (id 123…)` before sending to the model, so it can pass the exact id as `mention_user_id`; ids that weren't actually mentioned are rejected and fed back for a retry. The ping goes to the target in the channel where you asked, and `/reminders` shows who each reminder is for.
 
 This needs a model that supports function calling — most models in LM Studio do. If yours doesn't, normal chat still works (the bot retries without tools); only reminders won't be scheduled.
 

@@ -64,12 +64,13 @@ CREATE TABLE IF NOT EXISTS summaries (
 	PRIMARY KEY (user_id, channel_id)
 );
 CREATE TABLE IF NOT EXISTS reminders (
-	id         INTEGER PRIMARY KEY AUTOINCREMENT,
-	user_id    TEXT    NOT NULL,
-	channel_id TEXT    NOT NULL,
-	message    TEXT    NOT NULL,
-	due_at     INTEGER NOT NULL, -- unix seconds (UTC)
-	created_at TEXT    NOT NULL
+	id             INTEGER PRIMARY KEY AUTOINCREMENT,
+	user_id        TEXT    NOT NULL,
+	target_user_id TEXT    NOT NULL DEFAULT '',
+	channel_id     TEXT    NOT NULL,
+	message        TEXT    NOT NULL,
+	due_at         INTEGER NOT NULL, -- unix seconds (UTC)
+	created_at     TEXT    NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_reminders_due ON reminders (due_at);
 CREATE TABLE IF NOT EXISTS user_facts (
@@ -123,6 +124,15 @@ func migrate(db *sql.DB) error {
 			if _, err := db.Exec(s); err != nil {
 				return fmt.Errorf("migrate summaries: %w", err)
 			}
+		}
+	}
+
+	// reminders: add target_user_id for "tell @user ..." style reminders.
+	if ok, err := hasColumn(db, "reminders", "target_user_id"); err != nil {
+		return fmt.Errorf("inspect reminders: %w", err)
+	} else if !ok {
+		if _, err := db.Exec(`ALTER TABLE reminders ADD COLUMN target_user_id TEXT NOT NULL DEFAULT ''`); err != nil {
+			return fmt.Errorf("add reminders.target_user_id: %w", err)
 		}
 	}
 
@@ -332,21 +342,23 @@ func (s *Store) CommitCompaction(userID, channelID, summary string, ids []int64)
 	return tx.Commit()
 }
 
-// Reminder is a scheduled ping for one user in one channel. Reminders
-// survive bot restarts; the reminder worker delivers them when due.
+// Reminder is a scheduled ping in one channel. Reminders survive bot
+// restarts; the reminder worker delivers them when due.
 type Reminder struct {
-	ID        int64
-	UserID    string
-	ChannelID string
-	Message   string
-	DueAt     time.Time
+	ID           int64
+	UserID       string // who asked for it (listed by /reminders)
+	TargetUserID string // who gets pinged ("" = the requester)
+	ChannelID    string
+	Message      string
+	DueAt        time.Time
 }
 
-// AddReminder stores a new reminder and returns its id.
-func (s *Store) AddReminder(userID, channelID, message string, dueAt time.Time) (int64, error) {
+// AddReminder stores a new reminder and returns its id. targetUserID may be
+// empty, in which case the requester is pinged.
+func (s *Store) AddReminder(userID, targetUserID, channelID, message string, dueAt time.Time) (int64, error) {
 	res, err := s.db.Exec(
-		`INSERT INTO reminders (user_id, channel_id, message, due_at, created_at) VALUES (?, ?, ?, ?, ?)`,
-		userID, channelID, message, dueAt.UTC().Unix(), time.Now().UTC().Format(time.RFC3339),
+		`INSERT INTO reminders (user_id, target_user_id, channel_id, message, due_at, created_at) VALUES (?, ?, ?, ?, ?, ?)`,
+		userID, targetUserID, channelID, message, dueAt.UTC().Unix(), time.Now().UTC().Format(time.RFC3339),
 	)
 	if err != nil {
 		return 0, fmt.Errorf("insert reminder: %w", err)
@@ -361,7 +373,7 @@ func (s *Store) AddReminder(userID, channelID, message string, dueAt time.Time) 
 // DueReminders returns all reminders whose due time has passed, soonest first.
 func (s *Store) DueReminders(now time.Time) ([]Reminder, error) {
 	return s.queryReminders(
-		`SELECT id, user_id, channel_id, message, due_at FROM reminders WHERE due_at <= ? ORDER BY due_at ASC`,
+		`SELECT id, user_id, target_user_id, channel_id, message, due_at FROM reminders WHERE due_at <= ? ORDER BY due_at ASC`,
 		now.UTC().Unix(),
 	)
 }
@@ -370,7 +382,7 @@ func (s *Store) DueReminders(now time.Time) ([]Reminder, error) {
 // channels, soonest first.
 func (s *Store) PendingForUser(userID string) ([]Reminder, error) {
 	return s.queryReminders(
-		`SELECT id, user_id, channel_id, message, due_at FROM reminders WHERE user_id = ? ORDER BY due_at ASC`,
+		`SELECT id, user_id, target_user_id, channel_id, message, due_at FROM reminders WHERE user_id = ? ORDER BY due_at ASC`,
 		userID,
 	)
 }
@@ -394,7 +406,7 @@ func (s *Store) queryReminders(query string, args ...any) ([]Reminder, error) {
 	for rows.Next() {
 		var r Reminder
 		var due int64
-		if err := rows.Scan(&r.ID, &r.UserID, &r.ChannelID, &r.Message, &due); err != nil {
+		if err := rows.Scan(&r.ID, &r.UserID, &r.TargetUserID, &r.ChannelID, &r.Message, &due); err != nil {
 			return nil, fmt.Errorf("scan reminder: %w", err)
 		}
 		r.DueAt = time.Unix(due, 0).UTC()

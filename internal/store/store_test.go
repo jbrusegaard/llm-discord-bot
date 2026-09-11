@@ -199,13 +199,33 @@ func TestReminders(t *testing.T) {
 	defer s.Close()
 
 	now := time.Now()
-	idPast, err := s.AddReminder("u1", "chan-1", "stretch your legs", now.Add(-time.Minute))
+	idPast, err := s.AddReminder("u1", "", "chan-1", "stretch your legs", now.Add(-time.Minute))
 	if err != nil {
 		t.Fatalf("AddReminder (past): %v", err)
 	}
-	idFuture, err := s.AddReminder("u1", "dm-1", "call Sam", now.Add(10*time.Minute))
+	idFuture, err := s.AddReminder("u1", "", "dm-1", "call Sam", now.Add(10*time.Minute))
 	if err != nil {
 		t.Fatalf("AddReminder (future): %v", err)
+	}
+	// A reminder can target another user; the requester still owns it.
+	idTargeted, err := s.AddReminder("u1", "u2", "chan-1", "he is lame", now.Add(5*time.Minute))
+	if err != nil {
+		t.Fatalf("AddReminder (targeted): %v", err)
+	}
+
+	// Targeted reminders still belong to the requester in pending lists.
+	pending, err := s.PendingForUser("u1")
+	if err != nil || len(pending) != 3 {
+		t.Fatalf("PendingForUser with targeted = %+v (err %v); want all three", pending, err)
+	}
+	var targeted *Reminder
+	for i := range pending {
+		if pending[i].ID == idTargeted {
+			targeted = &pending[i]
+		}
+	}
+	if targeted == nil || targeted.TargetUserID != "u2" || targeted.UserID != "u1" {
+		t.Fatalf("targeted reminder = %+v, want target u2 owned by u1", targeted)
 	}
 
 	// Only the past-due reminder is due.
@@ -218,12 +238,12 @@ func TestReminders(t *testing.T) {
 	}
 
 	// Pending lists everything for the user across channels, soonest first.
-	pending, err := s.PendingForUser("u1")
+	pending, err = s.PendingForUser("u1")
 	if err != nil {
 		t.Fatalf("PendingForUser: %v", err)
 	}
-	if len(pending) != 2 || pending[0].ID != idPast || pending[1].ID != idFuture {
-		t.Fatalf("PendingForUser = %+v, want both reminders soonest-first", pending)
+	if len(pending) != 3 || pending[0].ID != idPast || pending[1].ID != idTargeted || pending[2].ID != idFuture {
+		t.Fatalf("PendingForUser = %+v, want all three reminders soonest-first", pending)
 	}
 
 	// Other users don't see this user's reminders.
@@ -231,7 +251,7 @@ func TestReminders(t *testing.T) {
 		t.Fatalf("other user should have no reminders, got %+v (err %v)", other, err)
 	}
 
-	// Deleting the due one leaves only the future reminder.
+	// Deleting the due one leaves the two not-yet-due reminders.
 	if err := s.DeleteReminder(idPast); err != nil {
 		t.Fatalf("DeleteReminder: %v", err)
 	}
@@ -243,8 +263,8 @@ func TestReminders(t *testing.T) {
 		t.Fatalf("after DeleteReminder: want none due, got %+v", due)
 	}
 	pending, err = s.PendingForUser("u1")
-	if err != nil || len(pending) != 1 || pending[0].ID != idFuture {
-		t.Fatalf("PendingForUser after delete = %+v (err %v), want only the future one", pending, err)
+	if err != nil || len(pending) != 2 || pending[0].ID != idTargeted || pending[1].ID != idFuture {
+		t.Fatalf("PendingForUser after delete = %+v (err %v), want the two not-yet-due ones", pending, err)
 	}
 }
 
