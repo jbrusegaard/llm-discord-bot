@@ -90,7 +90,7 @@ func (c *compactor) run(ctx context.Context) {
 // its oldest messages into a running summary until the history is back
 // under the threshold (or work is exhausted).
 func (c *compactor) compact(ctx context.Context, cv conv) error {
-	if err := waitForQuiet(ctx, c.st, cv); err != nil {
+	if err := waitForQuiet(ctx, c.st, cv, quietPeriod); err != nil {
 		return err
 	}
 
@@ -136,9 +136,9 @@ func (c *compactor) compact(ctx context.Context, cv conv) error {
 }
 
 // waitForQuiet returns once the conversation's most recent message is at
-// least quietPeriod old, or gives up after quietRetries waits. Shared by the
-// compactor and the fact extractor.
-func waitForQuiet(ctx context.Context, st *store.Store, cv conv) error {
+// least quiet old, or gives up after quietRetries waits. Shared by the
+// compactor and the fact extractor (each with its own quiet period).
+func waitForQuiet(ctx context.Context, st *store.Store, cv conv, quiet time.Duration) error {
 	for i := 0; i < quietRetries; i++ {
 		_, last, err := st.Stats(cv.user, cv.channel)
 		if err != nil {
@@ -147,7 +147,7 @@ func waitForQuiet(ctx context.Context, st *store.Store, cv conv) error {
 		if last.IsZero() {
 			return nil // no messages at all
 		}
-		wait := quietPeriod - time.Since(last)
+		wait := quiet - time.Since(last)
 		if wait <= 0 {
 			return nil
 		}
@@ -161,7 +161,7 @@ func waitForQuiet(ctx context.Context, st *store.Store, cv conv) error {
 		}
 	}
 	// Still active after the cap; skip this round rather than stall the queue.
-	slog.Debug("compaction deferred, user still active", "user", cv.user, "channel", cv.channel)
+	slog.Debug("background work deferred, user still active", "user", cv.user, "channel", cv.channel)
 	return nil
 }
 

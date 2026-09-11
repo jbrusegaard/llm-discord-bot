@@ -11,6 +11,10 @@ import (
 )
 
 const (
+	// factQuietPeriod is how long a user must be silent before facts are
+	// extracted. Shorter than the compactor's quiet period so "remember
+	// that..." lands quickly; still long enough to batch follow-up messages.
+	factQuietPeriod = 15 * time.Second
 	// maxFactMessages bounds how many new messages one extraction covers.
 	maxFactMessages = 24
 	// maxFactsPerExtraction caps facts stored from a single LLM call, so a
@@ -76,7 +80,7 @@ func (f *factExtractor) run(ctx context.Context) {
 // watermark is left unchanged so a later turn retries the same window (the
 // store's dedupe makes re-extraction safe).
 func (f *factExtractor) extract(ctx context.Context, cv conv) error {
-	if err := waitForQuiet(ctx, f.st, cv); err != nil {
+	if err := waitForQuiet(ctx, f.st, cv, factQuietPeriod); err != nil {
 		return err
 	}
 
