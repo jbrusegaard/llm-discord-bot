@@ -2,6 +2,7 @@ package store
 
 import (
 	"database/sql"
+	"fmt"
 	"path/filepath"
 	"testing"
 	"time"
@@ -326,5 +327,105 @@ CREATE TABLE summaries (
 	defer s2.Close()
 	if got, err := s2.GetSummary("u1", ""); err != nil || got != "old summary" {
 		t.Fatalf("summary after re-migration = %q, %v; want preserved", got, err)
+	}
+}
+
+func TestUserFacts(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "test.db")
+	s, err := New(path)
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	defer s.Close()
+
+	const user = "42"
+
+	added, err := s.AddFact(user, "The user's friend is named Alec")
+	if err != nil || !added {
+		t.Fatalf("AddFact new = %v, %v; want added", added, err)
+	}
+	// Case-insensitive duplicate is not stored again.
+	added, err = s.AddFact(user, "the user's friend is named aLEC")
+	if err != nil || added {
+		t.Fatalf("AddFact dup = %v, %v; want not added", added, err)
+	}
+	// Whitespace-only facts are ignored.
+	added, err = s.AddFact(user, "   ")
+	if err != nil || added {
+		t.Fatalf("AddFact empty = %v, %v; want ignored", added, err)
+	}
+
+	facts, err := s.FactsForUser(user)
+	if err != nil {
+		t.Fatalf("FactsForUser: %v", err)
+	}
+	if len(facts) != 1 || facts[0] != "The user's friend is named Alec" {
+		t.Fatalf("facts = %+v, want the single stored fact", facts)
+	}
+
+	// Facts are per user: another user starts empty.
+	if facts, err := s.FactsForUser("99"); err != nil || len(facts) != 0 {
+		t.Fatalf("other user should have no facts, got %+v (err %v)", facts, err)
+	}
+
+	// Chronological order is preserved.
+	if _, err := s.AddFact(user, "The user works as a designer"); err != nil {
+		t.Fatalf("AddFact: %v", err)
+	}
+	facts, err = s.FactsForUser(user)
+	if err != nil || len(facts) != 2 {
+		t.Fatalf("FactsForUser after second add = %+v (err %v); want 2 facts", facts, err)
+	}
+	if facts[0] != "The user's friend is named Alec" || facts[1] != "The user works as a designer" {
+		t.Fatalf("facts out of order: %+v", facts)
+	}
+}
+
+func TestSince(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "test.db")
+	s, err := New(path)
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	defer s.Close()
+
+	const user = "7"
+	const channel = "chan-1"
+	for i := 1; i <= 5; i++ {
+		if err := s.Append(user, channel, "user", fmt.Sprintf("msg %d", i)); err != nil {
+			t.Fatalf("Append: %v", err)
+		}
+	}
+
+	// Everything after id 0, chronological.
+	msgs, err := s.Since(user, channel, 0, 10)
+	if err != nil {
+		t.Fatalf("Since(0): %v", err)
+	}
+	if len(msgs) != 5 || msgs[0].Content != "msg 1" || msgs[4].Content != "msg 5" {
+		t.Fatalf("Since(0) = %+v, want all five in order", msgs)
+	}
+
+	// Only messages after a watermark.
+	msgs, err = s.Since(user, channel, 3, 10)
+	if err != nil {
+		t.Fatalf("Since(3): %v", err)
+	}
+	if len(msgs) != 2 || msgs[0].Content != "msg 4" || msgs[1].Content != "msg 5" {
+		t.Fatalf("Since(3) = %+v, want msg 4 and 5", msgs)
+	}
+
+	// Overflow keeps the newest rows only.
+	msgs, err = s.Since(user, channel, 0, 2)
+	if err != nil {
+		t.Fatalf("Since cap: %v", err)
+	}
+	if len(msgs) != 2 || msgs[0].Content != "msg 4" || msgs[1].Content != "msg 5" {
+		t.Fatalf("capped Since = %+v, want the two newest", msgs)
+	}
+
+	// Other conversations are isolated.
+	if msgs, err := s.Since(user, "chan-2", 0, 10); err != nil || len(msgs) != 0 {
+		t.Fatalf("other channel should have no messages, got %+v (err %v)", msgs, err)
 	}
 }

@@ -16,6 +16,10 @@ import (
 
 const discordMaxLen = 2000
 
+// memoryNote tells the model how its two memory layers work so it can answer
+// "what do you remember about me?" honestly.
+const memoryNote = "You have two kinds of memory: (1) a list of durable facts about each user, shared across all channels and DMs; (2) separate recent context for each channel/thread/DM conversation. When asked what you remember about them, use the stored facts."
+
 // Bot wires the Discord gateway to the LLM client.
 type Bot struct {
 	dg         *discordgo.Session
@@ -23,6 +27,7 @@ type Bot struct {
 	system     string
 	hist       *store.Store
 	compactor  *compactor
+	facts      *factExtractor
 	maxHistory int
 	timeout    time.Duration
 }
@@ -33,9 +38,10 @@ func New(cfg config.Config, session *discordgo.Session, hist *store.Store) *Bot 
 	return &Bot{
 		dg:         session,
 		llm:        client,
-		system:     cfg.SystemPrompt + "\n\n" + reminderToolNote,
+		system:     cfg.SystemPrompt + "\n\n" + reminderToolNote + "\n\n" + memoryNote,
 		hist:       hist,
 		compactor:  newCompactor(hist, client, cfg.CompactAt),
+		facts:      newFactExtractor(hist, client),
 		maxHistory: cfg.MaxHistory,
 		timeout:    3 * time.Minute,
 	}
@@ -45,6 +51,12 @@ func New(cfg config.Config, session *discordgo.Session, hist *store.Store) *Bot 
 // when ctx is cancelled.
 func (b *Bot) StartCompactor(ctx context.Context) {
 	go b.compactor.run(ctx)
+}
+
+// StartFactExtractor launches the background per-user fact extraction
+// worker; it stops when ctx is cancelled.
+func (b *Bot) StartFactExtractor(ctx context.Context) {
+	go b.facts.run(ctx)
 }
 
 // HandleMessageCreate is the discordgo OnMessageCreate callback.
@@ -89,6 +101,29 @@ func (b *Bot) HandleMessageCreate(_ *discordgo.Session, m *discordgo.MessageCrea
 		}
 		if _, err := b.dg.ChannelMessageSendReply(channel.ID, "✅ Memory cleared for this conversation.", m.SoftReference()); err != nil {
 			slog.Error("failed to send reset ack", "err", err)
+		}
+		return
+	}
+
+	if strings.EqualFold(text, "/facts") {
+		facts, err := b.hist.FactsForUser(m.Author.ID)
+		var out string
+		switch {
+		case err != nil:
+			slog.Error("failed to list user facts", "user", m.Author.ID, "err", err)
+			out = "⚠️ Couldn't load what I know about you."
+		case len(facts) == 0:
+			out = "🧠 I don't have any stored memories about you yet. Tell me something worth remembering!"
+		default:
+			var sb strings.Builder
+			fmt.Fprintf(&sb, "🧠 Here's what I remember about you:\n")
+			for _, f := range facts {
+				fmt.Fprintf(&sb, "• %s\n", f)
+			}
+			out = strings.TrimRight(sb.String(), "\n")
+		}
+		if _, err := b.dg.ChannelMessageSendReply(channel.ID, out, m.SoftReference()); err != nil {
+			slog.Error("failed to send facts list", "err", err)
 		}
 		return
 	}
@@ -184,6 +219,19 @@ func (b *Bot) chat(userID, channelID, text string) (string, error) {
 			Content: "Summary of the earlier part of this user's conversation:\n" + summary,
 		})
 	}
+	// Per-user facts apply in every channel and DM, so they are injected
+	// here regardless of where this conversation happens.
+	if facts, err := b.hist.FactsForUser(userID); err == nil && len(facts) > 0 {
+		var sb strings.Builder
+		for _, f := range facts {
+			fmt.Fprintf(&sb, "- %s\n", f)
+		}
+		messages = append(messages, llm.Message{
+			Role: llm.RoleSystem,
+			Content: "Things you know about this user from earlier conversations (shared across all channels and DMs):\n" +
+				strings.TrimRight(sb.String(), "\n"),
+		})
+	}
 	messages = append(messages, past...)
 	messages = append(messages, llm.Message{Role: llm.RoleUser, Content: text})
 
@@ -224,6 +272,7 @@ func (b *Bot) chat(userID, channelID, text string) (string, error) {
 		return "", fmt.Errorf("save assistant message: %w", err)
 	}
 	b.compactor.Enqueue(userID, channelID)
+	b.facts.Enqueue(userID, channelID)
 	return reply, nil
 }
 

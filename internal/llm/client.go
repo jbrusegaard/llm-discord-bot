@@ -191,6 +191,65 @@ func (c *Client) Summarize(ctx context.Context, existing string, msgs []Message)
 	return reply, nil
 }
 
+// ExtractFacts pulls durable facts about the user out of a conversation so
+// they can be remembered across all channels and DMs. existing lists facts
+// already stored, so the model is asked not to repeat them.
+func (c *Client) ExtractFacts(ctx context.Context, existing []string, msgs []Message) ([]string, error) {
+	var convo strings.Builder
+	for _, m := range msgs {
+		convo.WriteString(string(m.Role) + ": " + m.Content + "\n")
+	}
+	known := "(none yet)"
+	if len(existing) > 0 {
+		var sb strings.Builder
+		for _, f := range existing {
+			sb.WriteString("- " + f + "\n")
+		}
+		known = strings.TrimRight(sb.String(), "\n")
+	}
+
+	prompt := "You maintain a list of durable facts about one Discord user so the bot can remember them in every channel and DM.\n\n" +
+		"Facts already stored:\n" + known + "\n\n" +
+		"New conversation between this user and the assistant:\n" + convo.String() + "\n" +
+		"List any NEW durable facts about THIS USER worth remembering long-term (people they know, preferences, job, health, pets, plans). " +
+		"Do not repeat stored facts. Ignore small talk and details only relevant to this one channel. " +
+		"One fact per line in plain text, under 20 words each, phrased as a standalone statement (e.g. \"The user's friend is named Alec\"). " +
+		"If there are no new facts, output exactly: NONE"
+
+	reply, err := c.Chat(ctx, []Message{{Role: RoleUser, Content: prompt}})
+	if err != nil {
+		return nil, err
+	}
+	var out []string
+	for _, line := range strings.Split(reply, "\n") {
+		line = stripListMarker(line)
+		if line == "" || strings.EqualFold(line, "NONE") {
+			continue
+		}
+		out = append(out, line)
+	}
+	return out, nil
+}
+
+// stripListMarker trims leading bullets ("- ", "* ") or numbering ("1. ",
+// "2) ") from a model-output line.
+func stripListMarker(line string) string {
+	line = strings.TrimSpace(line)
+	for _, p := range []string{"- ", "* ", "• ", "# "} {
+		if strings.HasPrefix(line, p) {
+			return strings.TrimSpace(strings.TrimPrefix(line, p))
+		}
+	}
+	i := 0
+	for i < len(line) && line[i] >= '0' && line[i] <= '9' {
+		i++
+	}
+	if i > 0 && i < len(line) && (line[i] == '.' || line[i] == ')') {
+		return strings.TrimSpace(line[i+1:])
+	}
+	return line
+}
+
 // Ping checks the /v1/models endpoint; handy for startup diagnostics.
 func (c *Client) Ping(ctx context.Context) error {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, c.baseURL+"/models", nil)

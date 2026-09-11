@@ -16,10 +16,16 @@ import (
 // retention caps how many messages are kept per conversation to bound growth.
 const retention = 200
 
+// maxFacts caps how many stored facts about a user are injected into the prompt.
+const maxFacts = 50
+
 // Store persists chat history in a single SQLite file, so conversations
-// survive bot restarts. History is scoped per conversation: the pair of
-// (user_id, channel_id). DMs and each server channel or thread therefore
-// keep their own independent context.
+// survive bot restarts. Memory has two layers:
+//
+//   - per conversation: messages + summary scoped to (user_id, channel_id),
+//     so DMs and each server channel or thread keep independent context;
+//   - per user: durable facts ("my friend is Alec") shared across all of a
+//     user's conversations.
 type Store struct {
 	db *sql.DB
 }
@@ -66,6 +72,13 @@ CREATE TABLE IF NOT EXISTS reminders (
 	created_at TEXT    NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_reminders_due ON reminders (due_at);
+CREATE TABLE IF NOT EXISTS user_facts (
+	id         INTEGER PRIMARY KEY AUTOINCREMENT,
+	user_id    TEXT    NOT NULL,
+	fact       TEXT    NOT NULL,
+	created_at TEXT    NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_user_facts_user ON user_facts (user_id);
 `
 	if _, err := db.Exec(schema); err != nil {
 		db.Close()
@@ -389,6 +402,97 @@ func (s *Store) queryReminders(query string, args ...any) ([]Reminder, error) {
 	}
 	if err := rows.Err(); err != nil {
 		return nil, fmt.Errorf("iterate reminders: %w", err)
+	}
+	return out, nil
+}
+
+// AddFact stores a durable fact about a user, shared across all of their
+// conversations. It deduplicates case-insensitively and reports whether the
+// fact was new (false for empty or already-stored facts).
+func (s *Store) AddFact(userID, fact string) (bool, error) {
+	fact = strings.TrimSpace(fact)
+	if fact == "" {
+		return false, nil
+	}
+	var existing string
+	err := s.db.QueryRow(`SELECT fact FROM user_facts WHERE user_id = ? AND lower(fact) = lower(?)`, userID, fact).Scan(&existing)
+	switch {
+	case err == sql.ErrNoRows:
+		if _, err := s.db.Exec(
+			`INSERT INTO user_facts (user_id, fact, created_at) VALUES (?, ?, ?)`,
+			userID, fact, time.Now().UTC().Format(time.RFC3339),
+		); err != nil {
+			return false, fmt.Errorf("insert fact: %w", err)
+		}
+		return true, nil
+	case err == nil:
+		return false, nil // already stored
+	default:
+		return false, fmt.Errorf("check existing fact: %w", err)
+	}
+}
+
+// FactsForUser returns the user's stored facts (newest maxFacts), oldest
+// first so the prompt reads chronologically.
+func (s *Store) FactsForUser(userID string) ([]string, error) {
+	rows, err := s.db.Query(
+		`SELECT fact FROM user_facts WHERE user_id = ? ORDER BY id DESC LIMIT ?`, userID, maxFacts,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("query facts: %w", err)
+	}
+	defer rows.Close()
+
+	var out []string
+	for rows.Next() {
+		var fact string
+		if err := rows.Scan(&fact); err != nil {
+			return nil, fmt.Errorf("scan fact: %w", err)
+		}
+		out = append(out, fact)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate facts: %w", err)
+	}
+	// Query returned newest-first; reverse to chronological.
+	for i, j := 0, len(out)-1; i < j; i, j = i+1, j-1 {
+		out[i], out[j] = out[j], out[i]
+	}
+	return out, nil
+}
+
+// Since returns the conversation's messages with id > afterID in
+// chronological order. If more than limit qualify, only the newest limit are
+// returned; callers track a watermark and accept skipping older overflow.
+func (s *Store) Since(userID, channelID string, afterID int64, limit int) ([]StoredMessage, error) {
+	if limit <= 0 {
+		limit = 24
+	}
+	rows, err := s.db.Query(
+		`SELECT id, role, content FROM messages WHERE user_id = ? AND channel_id = ? AND id > ? ORDER BY id DESC LIMIT ?`,
+		userID, channelID, afterID, limit,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("query since: %w", err)
+	}
+	defer rows.Close()
+
+	var out []StoredMessage
+	for rows.Next() {
+		var m StoredMessage
+		var role string
+		if err := rows.Scan(&m.ID, &role, &m.Content); err != nil {
+			return nil, fmt.Errorf("scan since: %w", err)
+		}
+		m.Role = llm.Role(role)
+		out = append(out, m)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate since: %w", err)
+	}
+	// Query returned newest-first; reverse to chronological.
+	for i, j := 0, len(out)-1; i < j; i, j = i+1, j-1 {
+		out[i], out[j] = out[j], out[i]
 	}
 	return out, nil
 }

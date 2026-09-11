@@ -90,7 +90,7 @@ func (c *compactor) run(ctx context.Context) {
 // its oldest messages into a running summary until the history is back
 // under the threshold (or work is exhausted).
 func (c *compactor) compact(ctx context.Context, cv conv) error {
-	if err := c.waitForQuiet(ctx, cv); err != nil {
+	if err := waitForQuiet(ctx, c.st, cv); err != nil {
 		return err
 	}
 
@@ -136,10 +136,11 @@ func (c *compactor) compact(ctx context.Context, cv conv) error {
 }
 
 // waitForQuiet returns once the conversation's most recent message is at
-// least quietPeriod old, or gives up after quietRetries waits.
-func (c *compactor) waitForQuiet(ctx context.Context, cv conv) error {
+// least quietPeriod old, or gives up after quietRetries waits. Shared by the
+// compactor and the fact extractor.
+func waitForQuiet(ctx context.Context, st *store.Store, cv conv) error {
 	for i := 0; i < quietRetries; i++ {
-		_, last, err := c.st.Stats(cv.user, cv.channel)
+		_, last, err := st.Stats(cv.user, cv.channel)
 		if err != nil {
 			return err
 		}

@@ -62,6 +62,7 @@ func main() {
 
 	h := bot.New(cfg, dg, st)
 	h.StartCompactor(ctx)
+	h.StartFactExtractor(ctx)
 	h.StartReminderWorker(ctx)
 
 	pingCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
