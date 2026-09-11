@@ -18,12 +18,43 @@ const (
 	RoleSystem    Role = "system"
 	RoleUser      Role = "user"
 	RoleAssistant Role = "assistant"
+	// RoleTool carries the result of a tool call back to the model.
+	RoleTool Role = "tool"
 )
 
-// Message is a single chat message.
+// Message is a single chat message. ToolCalls/ToolCallID are only used for
+// function calling (see ChatWithTools).
 type Message struct {
 	Role    Role   `json:"role"`
 	Content string `json:"content"`
+	// ToolCalls, set on assistant messages when the model wants to call tools.
+	ToolCalls []ToolCall `json:"tool_calls,omitempty"`
+	// ToolCallID links a tool-result message to the call it answers.
+	ToolCallID string `json:"tool_call_id,omitempty"`
+}
+
+// ToolCall is one function invocation requested by the model. Arguments is
+// a JSON-encoded object, per the OpenAI spec (LM Studio follows it too).
+type ToolCall struct {
+	ID       string `json:"id"`
+	Type     string `json:"type"` // "function"
+	Function struct {
+		Name      string `json:"name"`
+		Arguments string `json:"arguments"`
+	} `json:"function"`
+}
+
+// Tool describes one callable function in the OpenAI tools schema.
+type Tool struct {
+	Type     string   `json:"type"` // "function"
+	Function Function `json:"function"`
+}
+
+// Function names a tool and gives its JSON-schema parameters.
+type Function struct {
+	Name        string         `json:"name"`
+	Description string         `json:"description,omitempty"`
+	Parameters  map[string]any `json:"parameters,omitempty"`
 }
 
 // Client talks to an OpenAI-compatible /v1/chat/completions endpoint
@@ -56,6 +87,7 @@ type ChatRequest struct {
 	Temperature float64   `json:"temperature,omitempty"`
 	MaxTokens   int       `json:"max_tokens,omitempty"`
 	Stream      bool      `json:"stream"`
+	Tools       []Tool    `json:"tools,omitempty"`
 }
 
 // chatResponse is the response envelope.
@@ -71,20 +103,30 @@ type chatResponse struct {
 
 // Chat sends the conversation to the model and returns the assistant reply.
 func (c *Client) Chat(ctx context.Context, messages []Message) (string, error) {
-	body := ChatRequest{
-		Model:       c.model,
-		Messages:    messages,
-		Temperature: 0.7,
-		Stream:      false,
+	msg, err := c.do(ctx, ChatRequest{Model: c.model, Messages: messages, Temperature: 0.7})
+	if err != nil {
+		return "", err
 	}
+	return msg.Content, nil
+}
+
+// ChatWithTools is like Chat but offers the model extra tools (function
+// calling). The returned message may carry ToolCalls instead of Content;
+// execute them and send tool-result messages back for a follow-up reply.
+func (c *Client) ChatWithTools(ctx context.Context, messages []Message, tools []Tool) (Message, error) {
+	return c.do(ctx, ChatRequest{Model: c.model, Messages: messages, Temperature: 0.7, Tools: tools})
+}
+
+// do performs one /chat/completions round trip and returns the assistant message.
+func (c *Client) do(ctx context.Context, body ChatRequest) (Message, error) {
 	payload, err := json.Marshal(body)
 	if err != nil {
-		return "", fmt.Errorf("encode request: %w", err)
+		return Message{}, fmt.Errorf("encode request: %w", err)
 	}
 
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.baseURL+"/chat/completions", bytes.NewReader(payload))
 	if err != nil {
-		return "", fmt.Errorf("build request: %w", err)
+		return Message{}, fmt.Errorf("build request: %w", err)
 	}
 	req.Header.Set("Content-Type", "application/json")
 	if c.apiKey != "" {
@@ -93,30 +135,30 @@ func (c *Client) Chat(ctx context.Context, messages []Message) (string, error) {
 
 	resp, err := c.http.Do(req)
 	if err != nil {
-		return "", fmt.Errorf("request failed (is LM Studio running at %s?): %w", c.baseURL, err)
+		return Message{}, fmt.Errorf("request failed (is LM Studio running at %s?): %w", c.baseURL, err)
 	}
 	defer resp.Body.Close()
 
 	data, err := io.ReadAll(io.LimitReader(resp.Body, 10<<20))
 	if err != nil {
-		return "", fmt.Errorf("read response: %w", err)
+		return Message{}, fmt.Errorf("read response: %w", err)
 	}
 	if resp.StatusCode != http.StatusOK {
 		var cr chatResponse
 		if json.Unmarshal(data, &cr) == nil && cr.Error != nil {
-			return "", fmt.Errorf("llm error (%d): %s", resp.StatusCode, cr.Error.Message)
+			return Message{}, fmt.Errorf("llm error (%d): %s", resp.StatusCode, cr.Error.Message)
 		}
-		return "", fmt.Errorf("unexpected status %d: %s", resp.StatusCode, strings.TrimSpace(string(data)))
+		return Message{}, fmt.Errorf("unexpected status %d: %s", resp.StatusCode, strings.TrimSpace(string(data)))
 	}
 
 	var cr chatResponse
 	if err := json.Unmarshal(data, &cr); err != nil {
-		return "", fmt.Errorf("decode response: %w", err)
+		return Message{}, fmt.Errorf("decode response: %w", err)
 	}
 	if len(cr.Choices) == 0 {
-		return "", fmt.Errorf("model returned no choices")
+		return Message{}, fmt.Errorf("model returned no choices")
 	}
-	return cr.Choices[0].Message.Content, nil
+	return cr.Choices[0].Message, nil
 }
 
 // Summarize condenses conversation messages into a short running summary,

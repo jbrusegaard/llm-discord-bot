@@ -57,6 +57,15 @@ CREATE TABLE IF NOT EXISTS summaries (
 	updated_at TEXT NOT NULL,
 	PRIMARY KEY (user_id, channel_id)
 );
+CREATE TABLE IF NOT EXISTS reminders (
+	id         INTEGER PRIMARY KEY AUTOINCREMENT,
+	user_id    TEXT    NOT NULL,
+	channel_id TEXT    NOT NULL,
+	message    TEXT    NOT NULL,
+	due_at     INTEGER NOT NULL, -- unix seconds (UTC)
+	created_at TEXT    NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_reminders_due ON reminders (due_at);
 `
 	if _, err := db.Exec(schema); err != nil {
 		db.Close()
@@ -308,6 +317,80 @@ func (s *Store) CommitCompaction(userID, channelID, summary string, ids []int64)
 		return fmt.Errorf("delete compacted rows: %w", err)
 	}
 	return tx.Commit()
+}
+
+// Reminder is a scheduled ping for one user in one channel. Reminders
+// survive bot restarts; the reminder worker delivers them when due.
+type Reminder struct {
+	ID        int64
+	UserID    string
+	ChannelID string
+	Message   string
+	DueAt     time.Time
+}
+
+// AddReminder stores a new reminder and returns its id.
+func (s *Store) AddReminder(userID, channelID, message string, dueAt time.Time) (int64, error) {
+	res, err := s.db.Exec(
+		`INSERT INTO reminders (user_id, channel_id, message, due_at, created_at) VALUES (?, ?, ?, ?, ?)`,
+		userID, channelID, message, dueAt.UTC().Unix(), time.Now().UTC().Format(time.RFC3339),
+	)
+	if err != nil {
+		return 0, fmt.Errorf("insert reminder: %w", err)
+	}
+	id, err := res.LastInsertId()
+	if err != nil {
+		return 0, fmt.Errorf("reminder id: %w", err)
+	}
+	return id, nil
+}
+
+// DueReminders returns all reminders whose due time has passed, soonest first.
+func (s *Store) DueReminders(now time.Time) ([]Reminder, error) {
+	return s.queryReminders(
+		`SELECT id, user_id, channel_id, message, due_at FROM reminders WHERE due_at <= ? ORDER BY due_at ASC`,
+		now.UTC().Unix(),
+	)
+}
+
+// PendingForUser lists a user's not-yet-delivered reminders across all
+// channels, soonest first.
+func (s *Store) PendingForUser(userID string) ([]Reminder, error) {
+	return s.queryReminders(
+		`SELECT id, user_id, channel_id, message, due_at FROM reminders WHERE user_id = ? ORDER BY due_at ASC`,
+		userID,
+	)
+}
+
+// DeleteReminder removes a delivered (or stale) reminder.
+func (s *Store) DeleteReminder(id int64) error {
+	if _, err := s.db.Exec(`DELETE FROM reminders WHERE id = ?`, id); err != nil {
+		return fmt.Errorf("delete reminder: %w", err)
+	}
+	return nil
+}
+
+func (s *Store) queryReminders(query string, args ...any) ([]Reminder, error) {
+	rows, err := s.db.Query(query, args...)
+	if err != nil {
+		return nil, fmt.Errorf("query reminders: %w", err)
+	}
+	defer rows.Close()
+
+	var out []Reminder
+	for rows.Next() {
+		var r Reminder
+		var due int64
+		if err := rows.Scan(&r.ID, &r.UserID, &r.ChannelID, &r.Message, &due); err != nil {
+			return nil, fmt.Errorf("scan reminder: %w", err)
+		}
+		r.DueAt = time.Unix(due, 0).UTC()
+		out = append(out, r)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate reminders: %w", err)
+	}
+	return out, nil
 }
 
 // Close releases the database handle.

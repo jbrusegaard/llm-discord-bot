@@ -4,6 +4,7 @@ import (
 	"database/sql"
 	"path/filepath"
 	"testing"
+	"time"
 
 	_ "modernc.org/sqlite"
 
@@ -185,6 +186,64 @@ func TestRetention(t *testing.T) {
 	}
 	if len(msgs) != 5 {
 		t.Fatalf("retention chan-2: want 5 rows, got %d", len(msgs))
+	}
+}
+
+func TestReminders(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "test.db")
+	s, err := New(path)
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	defer s.Close()
+
+	now := time.Now()
+	idPast, err := s.AddReminder("u1", "chan-1", "stretch your legs", now.Add(-time.Minute))
+	if err != nil {
+		t.Fatalf("AddReminder (past): %v", err)
+	}
+	idFuture, err := s.AddReminder("u1", "dm-1", "call Sam", now.Add(10*time.Minute))
+	if err != nil {
+		t.Fatalf("AddReminder (future): %v", err)
+	}
+
+	// Only the past-due reminder is due.
+	due, err := s.DueReminders(now)
+	if err != nil {
+		t.Fatalf("DueReminders: %v", err)
+	}
+	if len(due) != 1 || due[0].ID != idPast || due[0].Message != "stretch your legs" || due[0].ChannelID != "chan-1" {
+		t.Fatalf("DueReminders = %+v, want only the past-due reminder", due)
+	}
+
+	// Pending lists everything for the user across channels, soonest first.
+	pending, err := s.PendingForUser("u1")
+	if err != nil {
+		t.Fatalf("PendingForUser: %v", err)
+	}
+	if len(pending) != 2 || pending[0].ID != idPast || pending[1].ID != idFuture {
+		t.Fatalf("PendingForUser = %+v, want both reminders soonest-first", pending)
+	}
+
+	// Other users don't see this user's reminders.
+	if other, err := s.PendingForUser("u2"); err != nil || len(other) != 0 {
+		t.Fatalf("other user should have no reminders, got %+v (err %v)", other, err)
+	}
+
+	// Deleting the due one leaves only the future reminder.
+	if err := s.DeleteReminder(idPast); err != nil {
+		t.Fatalf("DeleteReminder: %v", err)
+	}
+	due, err = s.DueReminders(now)
+	if err != nil {
+		t.Fatalf("DueReminders after delete: %v", err)
+	}
+	if len(due) != 0 {
+		t.Fatalf("after DeleteReminder: want none due, got %+v", due)
+	}
+	pending, err = s.PendingForUser("u1")
+	if err != nil || len(pending) != 1 || pending[0].ID != idFuture {
+		t.Fatalf("PendingForUser after delete = %+v (err %v), want only the future one", pending, err)
 	}
 }
 

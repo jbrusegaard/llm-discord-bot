@@ -9,6 +9,7 @@ A Discord chat bot written in Go that answers using a local LM Studio server (Op
 - Chat via **DM** or `@mention` in a server
 - **Per-conversation memory**, persisted to SQLite across restarts — your DM, each channel, and each thread keep independent context (`/reset` clears the current conversation)
 - **Context compaction** — old messages are folded into a running summary in the background, so long conversations keep "memory" without an ever-growing prompt
+- **Reminders** — ask "remind me in 10 minutes to stretch" (or "ping me at 3pm about the meeting") and the bot schedules a ⏰ ping; `/reminders` lists what's pending
 - Replies use Discord's native reply feature (including the 🤔 Thinking… placeholder), so answers stay attached to your message
 - Typing indicator while the model generates; long replies split across multiple messages
 - Bot status shows which model is loaded (`🧠 <model>`)
@@ -79,7 +80,15 @@ Real environment variables always win over `.env` values.
 
 - **DM** the bot and just type.
 - In a server: `@YourBot hey there`
+- "Remind me in 10 minutes to stretch" — schedules a reminder; the bot confirms, then pings you with `⏰` when it's due (works with clock times too: "remind me at 3pm about the meeting")
+- `/reminders` — lists your pending reminders across all channels
 - `/reset` — clears the bot's memory for *this* conversation only (your DM and other channels/threads keep theirs).
+
+### How reminders work
+
+Every chat turn offers the model a `create_reminder` tool (OpenAI-style function calling). When you ask for a reminder, the model calls it with either a relative delay (`delay_minutes`) or an absolute time (`due_at`, RFC3339 in your local timezone — the bot tells the model the current date/time on every request), plus short reminder text. The bot stores it in SQLite (so reminders survive restarts) and a background worker checks every ~20 seconds, delivering due ones as `@you ⏰ <message>` in the channel where you asked.
+
+This needs a model that supports function calling — most models in LM Studio do. If yours doesn't, normal chat still works (the bot retries without tools); only reminders won't be scheduled.
 
 The bot answers using Discord's native reply feature, so every response shows as *Replying to <you>* directly under your message. Long replies are split across messages and each chunk stays linked to your original message.
 
@@ -121,6 +130,7 @@ internal/config/        env/.env loading and validation
 internal/llm/           OpenAI-compatible chat client for LM Studio
 internal/bot/           Discord handler, reply chunking, presence
 internal/bot/compactor.go  background summarization worker
+internal/bot/reminders.go  create_reminder tool + delivery worker
 internal/store/         SQLite persistence for chat history + summaries
 Makefile                build/test/tidy targets (static binary at bin/)
 .env.example            configuration template

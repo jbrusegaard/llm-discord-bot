@@ -33,7 +33,7 @@ func New(cfg config.Config, session *discordgo.Session, hist *store.Store) *Bot 
 	return &Bot{
 		dg:         session,
 		llm:        client,
-		system:     cfg.SystemPrompt,
+		system:     cfg.SystemPrompt + "\n\n" + reminderToolNote,
 		hist:       hist,
 		compactor:  newCompactor(hist, client, cfg.CompactAt),
 		maxHistory: cfg.MaxHistory,
@@ -89,6 +89,29 @@ func (b *Bot) HandleMessageCreate(_ *discordgo.Session, m *discordgo.MessageCrea
 		}
 		if _, err := b.dg.ChannelMessageSendReply(channel.ID, "✅ Memory cleared for this conversation.", m.SoftReference()); err != nil {
 			slog.Error("failed to send reset ack", "err", err)
+		}
+		return
+	}
+
+	if strings.EqualFold(text, "/reminders") {
+		pending, err := b.hist.PendingForUser(m.Author.ID)
+		var out string
+		switch {
+		case err != nil:
+			slog.Error("failed to list reminders", "user", m.Author.ID, "err", err)
+			out = "⚠️ Couldn't load your reminders."
+		case len(pending) == 0:
+			out = "⏰ No pending reminders. Ask me to remind you about something!"
+		default:
+			var sb strings.Builder
+			fmt.Fprintf(&sb, "⏰ You have %d pending reminder(s):\n", len(pending))
+			for _, r := range pending {
+				fmt.Fprintf(&sb, "• %s — %s\n", whenText(r.DueAt), r.Message)
+			}
+			out = strings.TrimRight(sb.String(), "\n")
+		}
+		if _, err := b.dg.ChannelMessageSendReply(channel.ID, out, m.SoftReference()); err != nil {
+			slog.Error("failed to send reminder list", "err", err)
 		}
 		return
 	}
@@ -151,7 +174,7 @@ func (b *Bot) chat(userID, channelID, text string) (string, error) {
 	// training cutoff), so tell them what time it is; without this they
 	// can't answer "what day is it?" correctly.
 	messages = append(messages, llm.Message{
-		Role:    llm.RoleSystem,
+		Role: llm.RoleSystem,
 		Content: "Current date and time on the machine running the bot: " +
 			time.Now().Format("Monday, January 2, 2006 at 3:04 PM MST"),
 	})
@@ -165,13 +188,32 @@ func (b *Bot) chat(userID, channelID, text string) (string, error) {
 	messages = append(messages, llm.Message{Role: llm.RoleUser, Content: text})
 
 	ctx, cancel := context.WithTimeout(context.Background(), b.timeout)
-	defer cancel()
+	replyMsg, err := b.llm.ChatWithTools(ctx, messages, []llm.Tool{createReminderTool})
+	cancel()
+	if err != nil {
+		// Some models reject the tools parameter; retry plain so basic chat
+		// still works (reminders just won't be scheduled).
+		slog.Warn("tool-enabled call failed; retrying without tools", "err", err)
+		ctx, cancel = context.WithTimeout(context.Background(), b.timeout)
+		plain, perr := b.llm.Chat(ctx, messages)
+		cancel()
+		if perr != nil {
+			return "", err // keep the original (more informative) error
+		}
+		replyMsg = llm.Message{Role: llm.RoleAssistant, Content: plain}
+	}
 
-	reply, err := b.llm.Chat(ctx, messages)
+	var reply string
+	if len(replyMsg.ToolCalls) > 0 {
+		// The model wants to schedule something; execute the tool calls and
+		// let it write a short confirmation.
+		reply, err = b.handleToolCalls(userID, channelID, messages, replyMsg)
+	} else {
+		reply = strings.TrimSpace(replyMsg.Content)
+	}
 	if err != nil {
 		return "", err
 	}
-	reply = strings.TrimSpace(reply)
 	if reply == "" {
 		return "", fmt.Errorf("empty model response")
 	}
